@@ -1,0 +1,987 @@
+# ==============================================================================
+# PACKAGE: Wallbox PV-Ladesteuerung (Home Assistant, OCPP-basiert)
+# ==============================================================================
+#
+# ZWECK
+# -----
+# Steuert eine Wallbox anhand eines auswaehlbaren Lademodus
+# (input_select.wallbox_lademodus), angelehnt an die klassischen EVCC-Modi.
+# Kombiniert PV-Ueberschussladen mit einem konfigurierbaren Schutz des
+# Hausakkus (Batterie-Vorrang-Schwelle).
+#
+# VORAUSSETZUNGEN
+# ----------------
+# - Eine Wallbox, die per OCPP lokal angesprochen wird (entwickelt/getestet
+#   mit einer Wallbox Copper Business + lokalem OCPP-Server) und dabei
+#   mindestens folgende Funktionen bietet: Start/Stop-Schalter, Ladestrom-
+#   Vorgabe (A), Ist-Ladeleistung, Connector-Status.
+# - Ein Hausspeichersystem/Wechselrichter, das Netzbezug/-einspeisung,
+#   Akku-Lade-/Entladeleistung und Akku-SOC als Sensoren bereitstellt - der
+#   Hersteller spielt keine Rolle, solange diese vier Werte irgendwoher als
+#   Home-Assistant-Sensoren vorliegen (entwickelt/getestet mit einem E3DC S10,
+#   sollte aber z.B. genauso mit Fronius, SolarEdge, sonnen, Victron o.ae.
+#   funktionieren). Andere Hersteller/Integrationen liefern ggf. andere
+#   Vorzeichen-Konventionen - vor Live-Betrieb unbedingt pruefen (siehe
+#   Hinweis beim Sensor "Wallbox Verfuegbarer Ladestrom" weiter unten).
+# - Optional: eine PV-Ertragsprognose (entwickelt/getestet mit Solcast) fuer
+#   die dynamische Akku-Vorrang-Schwelle/den dynamischen Mindeststrom. Ohne
+#   Prognose-Sensor fallen beide sicher auf ihre konservativen Maximal-/
+#   Minimalwerte zurueck.
+#
+# DIE 5 MODI (input_select.wallbox_lademodus)
+# -----------------------------------------------
+# | Modus          | Verhalten                                                                          |
+# |----------------|-------------------------------------------------------------------------------------|
+# | Aus            | Wallbox bleibt dauerhaft pausiert, keine weitere Logik greift                       |
+# | Sofortladen    | Volle feste Leistung (wallbox_boost_ladestrom), ignoriert PV UND Akku-SOC komplett  |
+# | PV-Ueberschuss | Nur echter PV-Ueberschuss (Akku-Entladung wird herausgerechnet), Akku-Vorrang-Schwelle, Hysterese |
+# | Min+PV         | Garantiert wallbox_min_ladestrom aus dem Netz + PV-Ueberschuss obendrauf, ignoriert Akku-SOC bewusst |
+# | Akku-Boost     | Feste Leistung (wallbox_akku_boost_ladestrom), stoppt beim Erreichen der Akku-Boost-Schwelle |
+#
+# WICHTIGER UNTERSCHIED Min+PV vs. Akku-Boost:
+#   Min+PV zapft NIE den Hausakku an - der garantierte Sockelstrom kommt
+#   aus dem Netz (der PV-Ueberschuss-Sensor rechnet Akku-Entladung ja
+#   weiterhin heraus). Akku-Boost dagegen erlaubt ausdruecklich das
+#   Entladen des Hausakkus zum Laden des Autos, nur eben nicht unter
+#   eine konfigurierbare Grenze.
+#
+# WICHTIG: SWITCH-POLARITAET
+# -----------------------------------------------------------------------------
+# Der Start/Stop-Schalter (siehe ABSCHNITT 0, Helfer wallbox_cfg_charge_control)
+# muss AN = "es SOLL geladen werden" bedeuten. Manche OCPP-/Wallbox-
+# Integrationen verwenden die umgekehrte Polaritaet (AN = pausiert) -
+# unbedingt vor Inbetriebnahme mit einem einzelnen Testladevorgang
+# verifizieren, sonst laedt die Wallbox in genau den Situationen, in denen
+# sie eigentlich pausieren sollte (und umgekehrt).
+#
+# BEWUSST NICHT UMGESETZT
+# -----------------------
+# - Preisbasiertes Laden (dynamische Stromtarife wie Tibber/aWattar)
+# - Netzdienliches Laden / Steuerbox-Signale (z.B. nach §14a EnWG)
+# - Phasenumschaltung 1-/3-phasig
+# - Zielladen / Ladeplan mit Abfahrtszeit (braucht Fahrzeug-SOC)
+#
+# BEKANNTE EINSCHRAENKUNGEN
+# --------------------------
+# - Ein Hausanschluss-Limit (max. Netzbezug insgesamt) wird nicht
+#   beruecksichtigt.
+# - Kein Zielladen/Ladeplan (fehlt: Fahrzeug-SOC-Sensor).
+# - Kein Solar-Anteil-Tracking der Ladesession (haengt von der jeweiligen
+#   OCPP-Implementierung ab, ob das ueberhaupt verfuegbar ist).
+# - Die dynamische Akku-Vorrang-Schwelle/der dynamische Mindeststrom
+#   verlassen sich auf die Qualitaet der PV-Prognose - bei falsch
+#   eingeschaetztem Wetter kann die Schwelle zeitweise zu niedrig oder zu
+#   hoch liegen. Faellt bei fehlendem/unbekanntem Prognosewert sicher auf
+#   den konservativen Wert zurueck.
+#
+# ==============================================================================
+
+
+# ==============================================================================
+# ABSCHNITT 0: KONFIGURATION - HIER ANPASSEN
+# ==============================================================================
+# Fast die gesamte Konfiguration passiert nach der Installation ganz ohne
+# YAML-Bearbeitung: Home Assistant -> Einstellungen -> Geraete & Dienste ->
+# Helfer -> die Eintraege "Wallbox Konfig: ..." suchen und dort jeweils die
+# Entity-ID deiner eigenen Installation eintragen (z.B. bei "Wallbox Konfig:
+# Netzbezug-Sensor" -> Wert "sensor.mein_wechselrichter_netzbezug"). Die
+# Helfer werden von diesem Package selbst angelegt (siehe input_text-Block
+# direkt unten) und sind mit einem klar erkennbaren Platzhalter vorbelegt.
+#
+# EINE Ausnahme (technisch bedingt): der Akku-SOC-Sensor wird auch in
+# Automations-TRIGGERN verwendet, und Home Assistant erlaubt dort aus
+# Architekturgruenden keine dynamische/Helfer-basierte Entity-ID - nur echte
+# YAML-Werte. Dieser eine Sensor muss deshalb weiterhin direkt im Dokument
+# angepasst werden, per YAML-Anker an EINER Stelle (im Editor nach
+# "&battery_soc" suchen):
+#   &battery_soc   sensor.YOUR_BATTERY_SOC   -> Akku-Ladezustand (%)
+#
+# Alle anderen Entities in dieser Datei (wallbox_*, input_select,
+# input_number, input_text) werden von diesem Package selbst angelegt und
+# muessen nicht angepasst werden.
+#
+# Die Vorzeichen-Konvention von Netzbezug/Akku-Leistung und die Zuordnung
+# der Connector-Status-Werte sind Annahmen aus der Entwicklungsumgebung -
+# vor Live-Betrieb einmal real verifizieren (z.B. Auto einstecken/ausstecken
+# und Werte in Entwicklerwerkzeuge -> Zustaende beobachten). Ein Diagnose-
+# Sensor ("Wallbox Konfiguration Unvollstaendig", siehe Abschnitt 2) warnt,
+# solange einer der Pflicht-Helfer noch auf seinem Platzhalter steht.
+# ==============================================================================
+input_text:
+  wallbox_cfg_charge_control:
+    name: "Wallbox Konfig: Start/Stop-Schalter deiner Wallbox (switch)"
+    icon: mdi:cog
+    initial: "switch.DEIN_WALLBOX_START_STOP_SCHALTER"
+    max: 255
+
+  wallbox_cfg_maximum_current:
+    name: "Wallbox Konfig: Ladestrom-Vorgabe deiner Wallbox (number)"
+    icon: mdi:cog
+    initial: "number.DEIN_WALLBOX_LADESTROM"
+    max: 255
+
+  wallbox_cfg_grid_power:
+    name: "Wallbox Konfig: Netzbezug-Sensor (positiv = Netzbezug)"
+    icon: mdi:cog
+    initial: "sensor.DEIN_NETZBEZUG_SENSOR"
+    max: 255
+
+  wallbox_cfg_battery_power:
+    name: "Wallbox Konfig: Akku-Leistung-Sensor (positiv = Akku laedt)"
+    icon: mdi:cog
+    initial: "sensor.DEIN_AKKU_LEISTUNG_SENSOR"
+    max: 255
+
+  wallbox_cfg_home_power:
+    name: "Wallbox Konfig: Hausverbrauch-Sensor (nur fuer Info-Sensor)"
+    icon: mdi:cog
+    initial: "sensor.DEIN_HAUSVERBRAUCH_SENSOR"
+    max: 255
+
+  wallbox_cfg_pv_power:
+    name: "Wallbox Konfig: PV-Erzeugung-Sensor (nur fuer Info-Sensor)"
+    icon: mdi:cog
+    initial: "sensor.DEINE_PV_ERZEUGUNG_SENSOR"
+    max: 255
+
+  wallbox_cfg_charger_power:
+    name: "Wallbox Konfig: Ist-Ladeleistung-Sensor deiner Wallbox"
+    icon: mdi:cog
+    initial: "sensor.DEINE_LADELEISTUNG_SENSOR"
+    max: 255
+
+  wallbox_cfg_connector_status:
+    name: "Wallbox Konfig: Connector-Status-Sensor deiner Wallbox"
+    icon: mdi:cog
+    initial: "sensor.DEIN_CONNECTOR_STATUS_SENSOR"
+    max: 255
+
+  wallbox_cfg_solcast_remaining:
+    name: "Wallbox Konfig: PV-Prognose Rest-Tagesertrag (optional)"
+    icon: mdi:cog
+    initial: "sensor.DEINE_SOLCAST_PROGNOSE_SENSOR"
+    max: 255
+
+
+# ------------------------------------------------------------------------------
+# ABSCHNITT 1: Moduswahl
+# ------------------------------------------------------------------------------
+input_select:
+  wallbox_lademodus:
+    name: "Wallbox Lademodus"
+    icon: mdi:ev-station
+    options:
+      - "Aus"
+      - "Sofortladen"
+      - "PV-Ueberschuss"
+      - "Min+PV"
+      - "Akku-Boost"
+    initial: "PV-Ueberschuss"
+
+
+# ------------------------------------------------------------------------------
+# ABSCHNITT 2: Berechnungs-Sensoren
+# ------------------------------------------------------------------------------
+template:
+  - sensor:
+      # Strom (A), der fuer die Wallbox verfuegbar waere, wenn sie gerade
+      # nichts laden wuerde. Basis: Netzbezug + aktueller Wallbox-Ladestrom.
+      # Rechnet Akku-Entladung bewusst HERAUS (schuetzt den Hausakku).
+      #
+      # Die Werte kommen ueber die input_text-Konfig-Helfer aus Abschnitt 0
+      # (doppelte states()-Aufloesung: erst den Helfer lesen, der die
+      # Entity-ID deiner Installation enthaelt, dann DIESE Entity lesen).
+      #
+      # Wird von BEIDEN Modi verwendet ("Min+PV" direkt, "PV-Ueberschuss"
+      # ueber die Variante unten). Bleibt bewusst "akku-blind" (nur
+      # Entladung rausgerechnet, Ladung zaehlt nie als verfuegbar).
+      #
+      # Sicherheitsabstand (wallbox_sicherheitsabstand, Watt, siehe evcc-
+      # Vorbild "residualPower"): Ziel ist bewusst NICHT exakt 0W Netzbezug,
+      # sondern ein kleiner konfigurierbarer Puffer (Default 200W). Ohne
+      # diesen Puffer balanciert die Regelung immer exakt auf der Kante
+      # zwischen Netzbezug und -einspeisung, was jede kleine Messschwankung
+      # sofort in ein sichtbares Auf/Ab uebersetzt. evcc empfiehlt aus
+      # demselben Grund 100-300W (siehe docs.evcc.io).
+      - name: "Wallbox Verfuegbarer Ladestrom"
+        unique_id: wallbox_verfuegbarer_ladestrom
+        unit_of_measurement: "A"
+        state: >
+          {% set netzbezug = states(states('input_text.wallbox_cfg_grid_power')) | float(0) %}
+          {% set wallbox_ist = states(states('input_text.wallbox_cfg_charger_power')) | float(0) %}
+          {% set batterie = states(states('input_text.wallbox_cfg_battery_power')) | float(0) %}
+          {% set batterie_entladend = [batterie, 0] | min %}
+          {% set sicherheit = states('input_number.wallbox_sicherheitsabstand') | float(200) %}
+          {% set ueberschuss_ohne_wallbox = -netzbezug + wallbox_ist + batterie_entladend - sicherheit %}
+          {% set ampere = (ueberschuss_ohne_wallbox / (230 * 3)) | round(0, 'floor') %}
+          {{ [ [ampere, 16] | min, 0] | max }}
+
+      # Dynamische Akku-Vorrang-Schwelle (optionale Solcast-Integration).
+      # Interpoliert zwischen input_number.wallbox_batterie_schwelle_min (bei
+      # sehr hoher PV-Prognose fuer den Rest des Tages) und dem bisherigen
+      # input_number.wallbox_batterie_schwelle als Maximalwert (bei wenig oder
+      # unbekannter Prognose - sicherer Rueckfallwert). Referenzwert
+      # input_number.wallbox_pv_prognose_referenz definiert, ab welchem
+      # prognostizierten Rest-kWh-Wert voll auf das Minimum abgesenkt wird.
+      # Wird von ALLEN Stellen verwendet, die sonst input_number.wallbox_
+      # batterie_schwelle direkt abfragen wuerden (siehe unten im Ueberschuss-
+      # modus-Sensor sowie den Automationen) - so bleibt die Akku-Vorrang-
+      # Logik an genau einer Stelle konsistent.
+      #
+      # ENTITY-ID-FALLE (wie bei sensor.wallbox_sollstrom_min_plus_pv, siehe
+      # unten): Die Entity-ID wird beim ersten Deploy aus dem "name" abgeleitet,
+      # NICHT aus unique_id. Bei spaeteren Namensaenderungen bitte die
+      # tatsaechliche Entity-ID in HA (Entwicklerwerkzeuge -> Zustaende)
+      # verifizieren, nicht annehmen.
+      - name: "Wallbox Batterie-Vorrang Schwelle Dynamisch"
+        unique_id: wallbox_batterie_vorrang_schwelle_dynamisch
+        unit_of_measurement: "%"
+        state: >
+          {% set rest = states(states('input_text.wallbox_cfg_solcast_remaining')) | float(-1) %}
+          {% set maximum = states('input_number.wallbox_batterie_schwelle') | float(90) %}
+          {% set minimum = states('input_number.wallbox_batterie_schwelle_min') | float(60) %}
+          {% set referenz = states('input_number.wallbox_pv_prognose_referenz') | float(25) %}
+          {% if rest < 0 or referenz <= 0 %}
+            {{ maximum | round(0) }}
+          {% else %}
+            {% set anteil = [ [rest / referenz, 1] | min, 0] | max %}
+            {{ (maximum - (maximum - minimum) * anteil) | round(0) }}
+          {% endif %}
+
+      # Dynamischer Mindeststrom (optionale Solcast-Integration, analog zur
+      # Akku-Vorrang-Schwelle oben, aber mit UMGEKEHRTER Interpolationsrichtung:
+      # bei viel PV-Prognose fuer den Rest des Tages darf der Mindeststrom
+      # HOCH gehen (Akku wird eh wieder voll, das Auto darf staerker profitieren),
+      # bei wenig/unbekannter Prognose bleibt er beim konservativen (= niedrigeren)
+      # Wert - sicherer Rueckfallwert.
+      #
+      # WICHTIG: Dieser Mindeststrom ist NICHT PV-bewusst - er greift rein
+      # anhand von SOC > Schwelle, unabhaengig vom aktuellen Wetter. Ein hoher
+      # Wert zieht also auch dann Netzstrom, wenn der Akku nur zufaellig noch
+      # ueber der Schwelle steht (z.B. am Tag nach viel Sonne), obwohl gerade
+      # keine PV-Leistung anliegt. Die Solcast-Kopplung hier mildert das nur
+      # ab (hoher Mindeststrom nur an Tagen mit viel PROGNOSTIZIERTEM
+      # Rest-Ertrag), verhindert es aber nicht vollstaendig.
+      #
+      # Nutzt bewusst denselben Referenzwert (wallbox_pv_prognose_referenz)
+      # wie die Akku-Vorrang-Schwelle oben - eine Prognose-Referenz fuer beide
+      # Interpolationen, statt zwei separate Einstellwerte zu pflegen.
+      - name: "Wallbox Mindeststrom Dynamisch"
+        unique_id: wallbox_mindeststrom_dynamisch
+        unit_of_measurement: "A"
+        state: >
+          {% set rest = states(states('input_text.wallbox_cfg_solcast_remaining')) | float(-1) %}
+          {% set minimum = states('input_number.wallbox_ueberschuss_mindeststrom') | float(8) %}
+          {% set maximum = states('input_number.wallbox_ueberschuss_mindeststrom_max') | float(14) %}
+          {% set referenz = states('input_number.wallbox_pv_prognose_referenz') | float(25) %}
+          {% if rest < 0 or referenz <= 0 %}
+            {{ minimum | round(0) }}
+          {% else %}
+            {% set anteil = [ [rest / referenz, 1] | min, 0] | max %}
+            {{ (minimum + (maximum - minimum) * anteil) | round(0) }}
+          {% endif %}
+
+      # SPEZIALFALL FUER "PV-Ueberschuss".
+      # Eine fruehere Idee (Akku-Ladeleistung live als verfuegbar mitzaehlen)
+      # hat sich als Regelschwingung erwiesen: Wallbox zieht Strom -> Speicher
+      # reagiert INNERHALB VON SEKUNDEN und drosselt die Akku-Ladung -> unser
+      # Sensor faellt sofort ab -> Automation pausiert -> Akku laedt wieder
+      # voll -> Sensor schnellt hoch -> Automation startet sofort neu (live
+      # beobachtet: alle ~90-150s kompletter Ladevorgangs-Neustart).
+      #
+      # Der Ansatz hier verzichtet auf jede live-schwankende Akku-Groesse:
+      # sobald SOC > Schwelle, gibt es fuer die Wallbox einen FESTEN
+      # Mindeststrom (sensor.wallbox_mindeststrom_dynamisch, siehe oben -
+      # "fest" heisst hier weiterhin: nicht von der Sekunde-fuer-Sekunde
+      # reagierenden Akku-Ladeleistung abhaengig, nur zwischen Automations-
+      # Durchlaeufen per Solcast-Prognose nachgefuehrt), analog zum
+      # Sockelstrom bei "Min+PV", zusaetzlich zu echtem Netz-Ueberschuss
+      # falls vorhanden. Da der Mindeststrom nicht live mit der
+      # Akku-Ladeleistung mitschwingt, kann sich hier kein Regelkreis mehr
+      # aufschaukeln - der Akku laedt ab der Schwelle einfach etwas
+      # langsamer weiter zu Ende, statt das Auto komplett leer ausgehen zu
+      # lassen. Unterhalb der Schwelle identisch zur akku-blinden Variante
+      # oben.
+      #
+      # SOC kommt hier bewusst NICHT ueber einen input_text-Helfer, sondern
+      # direkt als Platzhalter-Text (siehe Abschnitt 0) - derselbe Sensor
+      # wird unten in mehreren Automations-TRIGGERN gebraucht, wo Home
+      # Assistant keine Helfer-Aufloesung erlaubt. Ein Mix aus Helfer hier
+      # und Anker dort haette zwei Quellen fuer denselben Wert bedeutet.
+      - name: "Wallbox Verfuegbarer Ladestrom Ueberschussmodus"
+        unique_id: wallbox_verfuegbarer_ladestrom_ueberschussmodus
+        unit_of_measurement: "A"
+        state: >
+          {% set verfuegbar = states('sensor.wallbox_verfuegbarer_ladestrom') | float(0) %}
+          {% set soc = states('sensor.YOUR_BATTERY_SOC') | float(0) %}
+          {% set schwelle = states('sensor.wallbox_batterie_vorrang_schwelle_dynamisch') | float(90) %}
+          {% if soc > schwelle %}
+            {% set mindest = states('sensor.wallbox_mindeststrom_dynamisch') | float(8) %}
+            {{ [ [verfuegbar, mindest] | max, 16] | min }}
+          {% else %}
+            {{ verfuegbar }}
+          {% endif %}
+
+      # Reiner Info-Sensor (Dashboard) - einfache PV-minus-Haus-Rechnung zum
+      # Vergleich mit dem netzbezug-basierten Hauptsensor oben.
+      - name: "Wallbox Verfuegbarer Ladestrom PV Minus Haus (Info)"
+        unique_id: wallbox_verfuegbarer_ladestrom_pv_minus_haus
+        unit_of_measurement: "A"
+        state: >
+          {% set pv = states(states('input_text.wallbox_cfg_pv_power')) | float(0) %}
+          {% set haus = states(states('input_text.wallbox_cfg_home_power')) | float(0) %}
+          {% set ampere = ((pv - haus) / (230 * 3)) | round(0, 'floor') %}
+          {{ [ [ampere, 16] | min, 0] | max }}
+
+      # Soll-Strom fuer den Modus "Min+PV": garantierter Sockel plus
+      # zusaetzlichen PV-Ueberschuss, falls vorhanden.
+      # WICHTIG (Entity-ID-Falle): Wird diese Entity spaeter umbenannt (z.B.
+      # von "Min Plus PV" zu "MinPV"), aendert das NUR den Anzeigenamen,
+      # NICHT die bereits beim ersten Deploy vergebene Entity-ID. Die
+      # Automation unten muss dann weiterhin die urspruengliche Entity-ID
+      # referenzieren (in HA per core.entity_registry oder Entwicklerwerkzeuge
+      # -> Zustaende verifizieren).
+      - name: "Wallbox Sollstrom MinPV"
+        unique_id: wallbox_sollstrom_minpv
+        unit_of_measurement: "A"
+        state: >
+          {% set verfuegbar = states('sensor.wallbox_verfuegbarer_ladestrom') | float(0) %}
+          {% set mindest = states('input_number.wallbox_min_ladestrom') | float(6) %}
+          {{ [ [verfuegbar, mindest] | max, 16] | min }}
+
+      # Diagnose: warnt in einer Attributliste, welche Konfig-Helfer aus
+      # Abschnitt 0 noch auf ihrem Platzhalter stehen (also vermutlich noch
+      # nicht ausgefuellt wurden). solcast_remaining zaehlt bewusst NICHT
+      # als Pflichtfeld (siehe Voraussetzungen oben, optional).
+      - name: "Wallbox Konfiguration Fehlende Helfer"
+        unique_id: wallbox_konfiguration_fehlende_helfer
+        icon: mdi:alert-circle-outline
+        state: >
+          {% set pflicht = [
+            'wallbox_cfg_charge_control', 'wallbox_cfg_maximum_current',
+            'wallbox_cfg_grid_power', 'wallbox_cfg_battery_power',
+            'wallbox_cfg_home_power', 'wallbox_cfg_pv_power',
+            'wallbox_cfg_charger_power', 'wallbox_cfg_connector_status',
+          ] %}
+          {% set ns = namespace(fehlend=[]) %}
+          {% for key in pflicht %}
+            {% set ziel = states('input_text.' ~ key) %}
+            {% if states(ziel) in ['unknown', 'unavailable', ''] %}
+              {% set ns.fehlend = ns.fehlend + [key] %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.fehlend | length }}
+
+  - binary_sensor:
+      # Erwartet, dass der Connector-Status-Sensor deiner Wallbox den Wert
+      # "Available" liefert, wenn kein Auto angeschlossen ist (typischer
+      # OCPP-Wertebereich: Available/Preparing/Charging/Finishing/...).
+      # Falls deine Wallbox andere Werte liefert, hier anpassen.
+      - name: "Wallbox Auto Angeschlossen"
+        unique_id: wallbox_auto_angeschlossen
+        state: >
+          {{ states(states('input_text.wallbox_cfg_connector_status')) not in ['Available', 'unavailable', 'unknown'] }}
+
+      # Direkt nutzbar fuer eine Warn-Karte im Dashboard, siehe README.
+      - name: "Wallbox Konfiguration Unvollstaendig"
+        unique_id: wallbox_konfiguration_unvollstaendig
+        icon: mdi:alert
+        state: >
+          {{ states('sensor.wallbox_konfiguration_fehlende_helfer') | int(0) > 0 }}
+
+
+# ------------------------------------------------------------------------------
+# ABSCHNITT 3: Einstellwerte
+# ------------------------------------------------------------------------------
+input_number:
+  wallbox_unterversorgung_counter:
+    name: "Wallbox Unterversorgung Zaehler"
+    min: 0
+    max: 10
+    step: 1
+    initial: 0
+
+  # Start-Hysterese (evcc-Vorbild: Enable-Delay, dort default 1 Minute).
+  # Zaehlt bei /30s-Takt hoch, solange echter Ueberschuss ausreicht - der
+  # ERSTE Einschaltvorgang wartet auf einen Mindeststand (siehe Automation
+  # "PV-Ueberschuss: laden"), damit ein einzelner kurzer Ausschlag nicht
+  # sofort einen Ladevorgang anwirft. Laufende Ladevorgaenge sind davon
+  # nicht betroffen.
+  wallbox_ausreichend_pv_counter:
+    name: "Wallbox Ausreichend-PV Zaehler"
+    min: 0
+    max: 10
+    step: 1
+    initial: 0
+
+  # Der MAXIMALWERT im dynamischen Schwellen-Korridor (siehe
+  # sensor.wallbox_batterie_vorrang_schwelle_dynamisch) - greift bei wenig/
+  # unbekannter PV-Prognose, entspricht also dem konservativen Standardverhalten
+  # (bzw. dem einzigen Verhalten, falls keine PV-Prognose eingebunden wird).
+  wallbox_batterie_schwelle:
+    name: "Wallbox Batterie-Vorrang Schwelle Maximum (bei wenig PV-Prognose)"
+    icon: mdi:battery-charging-70
+    min: 0
+    max: 100
+    step: 1
+    initial: 90
+    unit_of_measurement: "%"
+
+  # Gegenstueck zu wallbox_batterie_schwelle: greift bei viel PV-Prognose
+  # fuer den Rest des Tages (siehe sensor.wallbox_batterie_vorrang_schwelle_dynamisch).
+  wallbox_batterie_schwelle_min:
+    name: "Wallbox Batterie-Vorrang Schwelle Minimum (bei viel PV-Prognose)"
+    icon: mdi:battery-charging-100
+    min: 0
+    max: 100
+    step: 1
+    initial: 60
+    unit_of_measurement: "%"
+
+  # Ab diesem prognostizierten Rest-Tagesertrag wird die Akku-Vorrang-Schwelle
+  # voll auf wallbox_batterie_schwelle_min abgesenkt UND der Mindeststrom voll
+  # auf wallbox_ueberschuss_mindeststrom_max angehoben (siehe
+  # sensor.wallbox_mindeststrom_dynamisch). Dazwischen wird jeweils linear
+  # interpoliert. Eine gemeinsame Referenz fuer beide Interpolationen,
+  # bewusst nicht dupliziert. Ohne PV-Prognose-Sensor wirkungslos (siehe
+  # Rueckfallverhalten in den beiden dynamischen Sensoren).
+  wallbox_pv_prognose_referenz:
+    name: "Wallbox PV-Prognose Referenzertrag (Rest heute, ab hier volle Absenkung)"
+    icon: mdi:weather-sunny
+    min: 0
+    max: 100
+    step: 1
+    initial: 25
+    unit_of_measurement: "kWh"
+
+  # Der Eckwert bei WENIG PV-Prognose (siehe sensor.wallbox_mindeststrom_
+  # dynamisch) bzw. der einzige wirksame Wert, falls keine PV-Prognose
+  # eingebunden wird. Gegenstueck siehe wallbox_ueberschuss_mindeststrom_max
+  # direkt darunter.
+  wallbox_ueberschuss_mindeststrom:
+    name: "Wallbox Mindeststrom Minimum (bei wenig PV-Prognose)"
+    icon: mdi:lightning-bolt-outline
+    min: 6
+    max: 16
+    step: 1
+    initial: 8
+    unit_of_measurement: "A"
+
+  # Gegenstueck zu wallbox_ueberschuss_mindeststrom: greift bei viel PV-
+  # Prognose fuer den Rest des Tages (siehe sensor.wallbox_mindeststrom_
+  # dynamisch). ACHTUNG: dieser Wert zieht ggf. Netzstrom, auch ohne
+  # aktuellen PV-Ueberschuss - siehe Warnhinweis beim Sensor oben.
+  wallbox_ueberschuss_mindeststrom_max:
+    name: "Wallbox Mindeststrom Maximum (bei viel PV-Prognose)"
+    icon: mdi:lightning-bolt
+    min: 6
+    max: 16
+    step: 1
+    initial: 14
+    unit_of_measurement: "A"
+
+  # Analog zu evcc's "residualPower" (dort 100-300W empfohlen). Wird im
+  # Basissensor "Wallbox Verfuegbarer Ladestrom" vom rechnerischen
+  # Ueberschuss abgezogen, damit die Regelung nicht exakt auf der Kante
+  # zwischen Netzbezug/-einspeisung balanciert.
+  wallbox_sicherheitsabstand:
+    name: "Wallbox Sicherheitsabstand (Ziel-Netzbezug statt exakt 0)"
+    icon: mdi:shield-outline
+    min: 0
+    max: 1000
+    step: 50
+    initial: 200
+    unit_of_measurement: "W"
+
+  wallbox_boost_ladestrom:
+    name: "Wallbox Ladestrom (Modus Sofortladen)"
+    icon: mdi:lightning-bolt
+    min: 6
+    max: 16
+    step: 1
+    initial: 16
+    unit_of_measurement: "A"
+
+  wallbox_min_ladestrom:
+    name: "Wallbox Mindeststrom (Modus Min+PV)"
+    icon: mdi:lightning-bolt-outline
+    min: 6
+    max: 16
+    step: 1
+    initial: 6
+    unit_of_measurement: "A"
+
+  wallbox_akku_boost_ladestrom:
+    name: "Wallbox Ladestrom (Modus Akku-Boost)"
+    icon: mdi:lightning-bolt
+    min: 6
+    max: 16
+    step: 1
+    initial: 16
+    unit_of_measurement: "A"
+
+  wallbox_akku_boost_schwelle:
+    name: "Wallbox Akku-Untergrenze (Modus Akku-Boost)"
+    icon: mdi:battery-charging-30
+    min: 0
+    max: 100
+    step: 1
+    initial: 50
+    unit_of_measurement: "%"
+
+
+# ------------------------------------------------------------------------------
+# ABSCHNITT 4: Automatisierungen
+# ------------------------------------------------------------------------------
+# Start/Stop-Schalter und Ladestrom-Vorgabe kommen ueberall ueber die
+# input_text-Helfer aus Abschnitt 0 (siehe dortige Erklaerung). Da HA in
+# Bedingungen/Zielen (anders als in Triggern) Templates erlaubt, geht das
+# hier ohne YAML-Anker: "condition: state" wird zu "condition: template"
+# mit is_state(), literale entity_id-Ziele werden zu Templates.
+automation:
+
+  # --- 4.1 Unterversorgungs-Zaehler (nur Modus PV-Ueberschuss) ----------------
+  - alias: "Wallbox - Unterversorgung zaehlen"
+    trigger:
+      - platform: time_pattern
+        seconds: "/30"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.wallbox_auto_angeschlossen
+        state: "on"
+      - condition: state
+        entity_id: input_select.wallbox_lademodus
+        state: "PV-Ueberschuss"
+    action:
+      - choose:
+          - conditions:
+              - condition: numeric_state
+                entity_id: sensor.wallbox_verfuegbarer_ladestrom_ueberschussmodus
+                below: 6
+            sequence:
+              - service: input_number.increment
+                target:
+                  entity_id: input_number.wallbox_unterversorgung_counter
+        default:
+          - service: input_number.set_value
+            target:
+              entity_id: input_number.wallbox_unterversorgung_counter
+            data:
+              value: 0
+
+  # --- 4.1b Ausreichend-PV-Zaehler (Start-Hysterese, evcc-Vorbild) ------------
+  # Spiegelbild von 4.1: zaehlt hoch, solange echter Ueberschuss (inkl. ggf.
+  # Mindeststrom-Floor) ausreicht. Wird von 4.5 abgefragt, um den ERSTEN
+  # Einschaltvorgang um ein paar Zyklen zu verzoegern (evcc: 1 Minute
+  # Enable-Delay) - ein einzelner kurzer Ausschlag reicht dann nicht mehr.
+  - alias: "Wallbox - Ausreichend-PV zaehlen"
+    trigger:
+      - platform: time_pattern
+        seconds: "/30"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.wallbox_auto_angeschlossen
+        state: "on"
+      - condition: state
+        entity_id: input_select.wallbox_lademodus
+        state: "PV-Ueberschuss"
+      - condition: numeric_state
+        entity_id: &battery_soc sensor.YOUR_BATTERY_SOC
+        above: sensor.wallbox_batterie_vorrang_schwelle_dynamisch
+    action:
+      - choose:
+          - conditions:
+              - condition: numeric_state
+                entity_id: sensor.wallbox_verfuegbarer_ladestrom_ueberschussmodus
+                above: 5
+            sequence:
+              - service: input_number.increment
+                target:
+                  entity_id: input_number.wallbox_ausreichend_pv_counter
+        default:
+          - service: input_number.set_value
+            target:
+              entity_id: input_number.wallbox_ausreichend_pv_counter
+            data:
+              value: 0
+
+  # --- 4.2 Zaehler zuruecksetzen beim Verlassen von "PV-Ueberschuss" ----------
+  # Verhindert, dass ein hoher Zaehlerstand aus der letzten Sitzung sofort
+  # wieder eine Pause/einen Sofortstart ausloest, wenn spaeter erneut in
+  # "PV-Ueberschuss" gewechselt wird bzw. die Akku-Vorrang-Schwelle wieder
+  # unterschritten wird (setzt auch den Ausreichend-PV-Zaehler zurueck, siehe
+  # 4.1b - der zaehlt naemlich nur bei SOC > Schwelle hoch und wuerde sonst
+  # bei einem kurzen Unterschreiten einfach einfrieren statt zurueckzusetzen).
+  - alias: "Wallbox - Zaehler zuruecksetzen bei Moduswechsel"
+    trigger:
+      - platform: state
+        entity_id: input_select.wallbox_lademodus
+        from: "PV-Ueberschuss"
+      - platform: numeric_state
+        entity_id: *battery_soc
+        below: sensor.wallbox_batterie_vorrang_schwelle_dynamisch
+    action:
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.wallbox_unterversorgung_counter
+        data:
+          value: 0
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.wallbox_ausreichend_pv_counter
+        data:
+          value: 0
+
+  # --- 4.3 PV-Ueberschuss: pausieren (zu wenig PV) ----------------------------
+  - alias: "Wallbox - PV-Ueberschuss: pausieren (zu wenig PV)"
+    trigger:
+      - platform: numeric_state
+        entity_id: input_number.wallbox_unterversorgung_counter
+        above: 2
+    condition:
+      - condition: state
+        entity_id: binary_sensor.wallbox_auto_angeschlossen
+        state: "on"
+      - condition: state
+        entity_id: input_select.wallbox_lademodus
+        state: "PV-Ueberschuss"
+      - condition: numeric_state
+        entity_id: *battery_soc
+        below: 95
+    action:
+      # charge_control AUS = nicht laden (siehe Polaritaets-Hinweis oben).
+      # Nur aufrufen, wenn tatsaechlich noch "an" - sonst schickt die OCPP-
+      # Integration bei jedem 30s-Tick ein erneutes StopTransaction raus,
+      # das die Wallbox mangels aktiver Transaktion mit "Rejected" quittiert.
+      - if:
+          - condition: template
+            value_template: "{{ is_state(states('input_text.wallbox_cfg_charge_control'), 'on') }}"
+        then:
+          - service: switch.turn_off
+            target:
+              entity_id: "{{ states('input_text.wallbox_cfg_charge_control') }}"
+
+  # --- 4.4 PV-Ueberschuss: pausieren (Batterie-Vorrang) -----------------------
+  # Reagiert sofort beim Unterschreiten der Schwelle, ohne den
+  # Unterversorgungs-Zaehler abzuwarten (bewusste Prioritaets-Entscheidung).
+  #
+  # WICHTIG: Ein reiner numeric_state-"below"-Trigger feuert nur beim
+  # UEBERGANG ueber/unter die Schwelle, nicht solange der Zustand bereits
+  # "below" ist. Wurde der Modus erst NACH dem Unterschreiten auf
+  # "PV-Ueberschuss" gewechselt (oder HA neugestartet, waehrend der SOC schon
+  # unten war), gibt es keinen Uebergang -> die Pause wuerde nie feuern und
+  # die Wallbox wuerde trotz niedrigem SOC munter weiterladen. Deshalb
+  # zusaetzlich ein time_pattern-Trigger mit explizitem "below"-Condition,
+  # analog zum periodischen Nachfuehren in "PV-Ueberschuss: laden".
+  - alias: "Wallbox - PV-Ueberschuss: pausieren (Batterie-Vorrang)"
+    trigger:
+      - platform: numeric_state
+        entity_id: *battery_soc
+        below: sensor.wallbox_batterie_vorrang_schwelle_dynamisch
+      - platform: time_pattern
+        seconds: "/30"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.wallbox_auto_angeschlossen
+        state: "on"
+      - condition: state
+        entity_id: input_select.wallbox_lademodus
+        state: "PV-Ueberschuss"
+      - condition: numeric_state
+        entity_id: *battery_soc
+        below: sensor.wallbox_batterie_vorrang_schwelle_dynamisch
+    action:
+      # charge_control AUS = nicht laden (siehe Polaritaets-Hinweis oben).
+      # Guard wie bei 4.3 (siehe dortiger Kommentar) - vermeidet
+      # wiederholte StopTransaction-Aufrufe/"Rejected" bei jedem 30s-Tick.
+      - if:
+          - condition: template
+            value_template: "{{ is_state(states('input_text.wallbox_cfg_charge_control'), 'on') }}"
+        then:
+          - service: switch.turn_off
+            target:
+              entity_id: "{{ states('input_text.wallbox_cfg_charge_control') }}"
+
+  # --- 4.5 PV-Ueberschuss: laden / Ladestrom nachfuehren ----------------------
+  # Trigger auf wallbox_auto_angeschlossen->on sorgt dafuer, dass beim
+  # Einstecken sofort reagiert wird, statt bis zu 30s auf den naechsten
+  # time_pattern-Tick zu warten (der bleibt fuer die laufende
+  # PV-Nachfuehrung weiterhin noetig).
+  #
+  # Start-Hysterese (evcc-Vorbild): Der ERSTE Einschaltvorgang (charge_control
+  # noch "off") wartet zusaetzlich auf den Ausreichend-PV-Zaehler aus 4.1b
+  # (above:1 = mind. 2 aufeinanderfolgende Zyklen a 30s, ~1 Minute sustained -
+  # evcc nennt das "Enable-Delay" und nutzt denselben Default). Ist bereits
+  # geladen wird (charge_control "on"), greift die Zaehler-Bedingung NICHT -
+  # das laufende Nachfuehren des Ladestroms bleibt so reaktionsschnell wie
+  # bisher, nur der Erststart hat eine Verzoegerung.
+  - alias: "Wallbox - PV-Ueberschuss: laden"
+    trigger:
+      - platform: time_pattern
+        seconds: "/30"
+      - platform: state
+        entity_id: input_select.wallbox_lademodus
+        to: "PV-Ueberschuss"
+      - platform: state
+        entity_id: binary_sensor.wallbox_auto_angeschlossen
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.wallbox_auto_angeschlossen
+        state: "on"
+      - condition: state
+        entity_id: input_select.wallbox_lademodus
+        state: "PV-Ueberschuss"
+      - condition: numeric_state
+        entity_id: *battery_soc
+        above: sensor.wallbox_batterie_vorrang_schwelle_dynamisch
+      # "above: 5" statt 6, damit der feste Mindeststrom aus
+      # wallbox_ueberschuss_mindeststrom (Default 8A) diese Bedingung
+      # bei exakt 6A auch erfuellt (above:6 waere bei genau 6 = false).
+      - condition: numeric_state
+        entity_id: sensor.wallbox_verfuegbarer_ladestrom_ueberschussmodus
+        above: 5
+      - condition: or
+        conditions:
+          - condition: template
+            value_template: "{{ is_state(states('input_text.wallbox_cfg_charge_control'), 'on') }}"
+          - condition: numeric_state
+            entity_id: input_number.wallbox_ausreichend_pv_counter
+            above: 1
+    action:
+      # charge_control AN = laden (siehe Polaritaets-Hinweis oben).
+      # Nur aufrufen, wenn tatsaechlich noch "aus" - sonst schickt die OCPP-
+      # Integration bei jedem 30s-Tick ein erneutes RemoteStartTransaction
+      # raus, das die Wallbox waehrend einer laufenden Transaktion mit
+      # "Rejected" quittiert. Das Nachfuehren des Ladestroms unten bleibt
+      # davon unberuehrt und laeuft weiterhin bei jedem Tick.
+      - if:
+          - condition: template
+            value_template: "{{ is_state(states('input_text.wallbox_cfg_charge_control'), 'off') }}"
+        then:
+          - service: switch.turn_on
+            target:
+              entity_id: "{{ states('input_text.wallbox_cfg_charge_control') }}"
+      - service: number.set_value
+        target:
+          entity_id: "{{ states('input_text.wallbox_cfg_maximum_current') }}"
+        data:
+          value: "{{ states('sensor.wallbox_verfuegbarer_ladestrom_ueberschussmodus') }}"
+
+  # --- 4.6 Min+PV: laden / Ladestrom nachfuehren ------------------------------
+  # Ignoriert bewusst den Akku-SOC - der garantierte Sockelstrom kommt aus
+  # dem Netz, nicht aus dem Hausakku (siehe Modus-Tabelle oben).
+  - alias: "Wallbox - Min+PV: laden"
+    trigger:
+      - platform: time_pattern
+        seconds: "/30"
+      - platform: state
+        entity_id: input_select.wallbox_lademodus
+        to: "Min+PV"
+      - platform: state
+        entity_id: binary_sensor.wallbox_auto_angeschlossen
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.wallbox_auto_angeschlossen
+        state: "on"
+      - condition: state
+        entity_id: input_select.wallbox_lademodus
+        state: "Min+PV"
+    action:
+      # charge_control AN = laden (siehe Polaritaets-Hinweis oben).
+      # Guard wie bei 4.5 (siehe dortiger Kommentar) - vermeidet
+      # wiederholte RemoteStartTransaction-Aufrufe/"Rejected" bei jedem
+      # 30s-Tick, wenn ohnehin schon geladen wird.
+      - if:
+          - condition: template
+            value_template: "{{ is_state(states('input_text.wallbox_cfg_charge_control'), 'off') }}"
+        then:
+          - service: switch.turn_on
+            target:
+              entity_id: "{{ states('input_text.wallbox_cfg_charge_control') }}"
+      - service: number.set_value
+        target:
+          entity_id: "{{ states('input_text.wallbox_cfg_maximum_current') }}"
+        data:
+          value: "{{ states('sensor.wallbox_sollstrom_minpv') }}"
+
+  # --- 4.7 Sofortladen: volle Leistung, ignoriert PV und Akku-SOC -------------
+  # Woher die Energie kommt (PV, Netz oder Batterie), entscheidet bewusst
+  # NICHT diese Automatisierung, sondern die interne Energiesteuerung deines
+  # Speichersystems - die hat ihre eigene Reserve-/Mindest-SOC-Logik.
+  - alias: "Wallbox - Sofortladen: volle Leistung"
+    trigger:
+      - platform: time_pattern
+        seconds: "/30"
+      - platform: state
+        entity_id: input_select.wallbox_lademodus
+        to: "Sofortladen"
+      - platform: state
+        entity_id: binary_sensor.wallbox_auto_angeschlossen
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.wallbox_auto_angeschlossen
+        state: "on"
+      - condition: state
+        entity_id: input_select.wallbox_lademodus
+        state: "Sofortladen"
+    action:
+      # charge_control AN = laden (siehe Polaritaets-Hinweis oben).
+      # Guard wie bei 4.5 (siehe dortiger Kommentar).
+      - if:
+          - condition: template
+            value_template: "{{ is_state(states('input_text.wallbox_cfg_charge_control'), 'off') }}"
+        then:
+          - service: switch.turn_on
+            target:
+              entity_id: "{{ states('input_text.wallbox_cfg_charge_control') }}"
+      - service: number.set_value
+        target:
+          entity_id: "{{ states('input_text.wallbox_cfg_maximum_current') }}"
+        data:
+          value: "{{ states('input_number.wallbox_boost_ladestrom') }}"
+
+  # --- 4.8 Akku-Boost: laden mit fester Leistung ------------------------------
+  # Erlaubt ausdruecklich das Entladen des Hausakkus (anders als
+  # "PV-Ueberschuss" und "Min+PV"), aber nur oberhalb der Akku-Untergrenze.
+  - alias: "Wallbox - Akku-Boost: laden"
+    trigger:
+      - platform: time_pattern
+        seconds: "/30"
+      - platform: state
+        entity_id: input_select.wallbox_lademodus
+        to: "Akku-Boost"
+      - platform: state
+        entity_id: binary_sensor.wallbox_auto_angeschlossen
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.wallbox_auto_angeschlossen
+        state: "on"
+      - condition: state
+        entity_id: input_select.wallbox_lademodus
+        state: "Akku-Boost"
+      - condition: numeric_state
+        entity_id: *battery_soc
+        above: input_number.wallbox_akku_boost_schwelle
+    action:
+      # charge_control AN = laden (siehe Polaritaets-Hinweis oben).
+      # Guard wie bei 4.5 (siehe dortiger Kommentar).
+      - if:
+          - condition: template
+            value_template: "{{ is_state(states('input_text.wallbox_cfg_charge_control'), 'off') }}"
+        then:
+          - service: switch.turn_on
+            target:
+              entity_id: "{{ states('input_text.wallbox_cfg_charge_control') }}"
+      - service: number.set_value
+        target:
+          entity_id: "{{ states('input_text.wallbox_cfg_maximum_current') }}"
+        data:
+          value: "{{ states('input_number.wallbox_akku_boost_ladestrom') }}"
+
+  # --- 4.9 Akku-Boost: pausieren (Akku-Untergrenze erreicht) ------------------
+  # Gleiche Ursache wie bei 4.4: zusaetzlicher time_pattern-Trigger +
+  # explizites "below"-Condition, damit die Pause auch dann greift, wenn der
+  # SOC beim Umschalten auf "Akku-Boost" bereits unter der Schwelle liegt
+  # (reiner numeric_state-Trigger feuert nur beim Uebergang).
+  - alias: "Wallbox - Akku-Boost: pausieren (Untergrenze erreicht)"
+    trigger:
+      - platform: numeric_state
+        entity_id: *battery_soc
+        below: input_number.wallbox_akku_boost_schwelle
+      - platform: time_pattern
+        seconds: "/30"
+    condition:
+      - condition: state
+        entity_id: binary_sensor.wallbox_auto_angeschlossen
+        state: "on"
+      - condition: state
+        entity_id: input_select.wallbox_lademodus
+        state: "Akku-Boost"
+      - condition: numeric_state
+        entity_id: *battery_soc
+        below: input_number.wallbox_akku_boost_schwelle
+    action:
+      # charge_control AUS = nicht laden (siehe Polaritaets-Hinweis oben).
+      # Guard wie bei 4.3 (siehe dortiger Kommentar).
+      - if:
+          - condition: template
+            value_template: "{{ is_state(states('input_text.wallbox_cfg_charge_control'), 'on') }}"
+        then:
+          - service: switch.turn_off
+            target:
+              entity_id: "{{ states('input_text.wallbox_cfg_charge_control') }}"
+
+  # --- 4.10 Aus: Wallbox bleibt dauerhaft pausiert ----------------------------
+  - alias: "Wallbox - Aus: pausiert halten"
+    trigger:
+      - platform: time_pattern
+        seconds: "/30"
+      - platform: state
+        entity_id: input_select.wallbox_lademodus
+        to: "Aus"
+    condition:
+      - condition: state
+        entity_id: input_select.wallbox_lademodus
+        state: "Aus"
+    action:
+      # charge_control AUS = nicht laden (siehe Polaritaets-Hinweis oben).
+      # Guard wie bei 4.3 (siehe dortiger Kommentar).
+      - if:
+          - condition: template
+            value_template: "{{ is_state(states('input_text.wallbox_cfg_charge_control'), 'on') }}"
+        then:
+          - service: switch.turn_off
+            target:
+              entity_id: "{{ states('input_text.wallbox_cfg_charge_control') }}"
+
+  # --- 4.11 Kein Auto: Modus auf "Aus" erzwingen ------------------------------
+  # input_select kennt kein eigenes "disabled" - das hier ist der zuverlaessige
+  # Ersatz dafuer: sowohl beim Trennen des Autos als auch bei jedem Versuch,
+  # den Modus waehrend der Trennung zu aendern, wird sofort auf "Aus"
+  # zurueckgesetzt. Der Dashboard-Schalter bleibt also technisch anklickbar,
+  # jede andere Wahl springt aber umgehend zurueck.
+  - alias: "Wallbox - Kein Auto: Modus auf Aus erzwingen"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.wallbox_auto_angeschlossen
+        to: "off"
+      - platform: state
+        entity_id: input_select.wallbox_lademodus
+    condition:
+      - condition: state
+        entity_id: binary_sensor.wallbox_auto_angeschlossen
+        state: "off"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.wallbox_lademodus
+            state: "Aus"
+    action:
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.wallbox_lademodus
+        data:
+          option: "Aus"
+
+  # --- 4.12 Auto eingesteckt: Modus auf PV-Ueberschuss setzen -----------------
+  # Gegenstueck zu 4.11: sobald der Connector-Status von "Available" auf
+  # einen anderen Wert wechselt (= binary_sensor.wallbox_auto_angeschlossen
+  # geht auf "on", siehe Abschnitt 2), wird automatisch in "PV-Ueberschuss"
+  # geschaltet, statt im zuletzt gewaehlten (evtl. "Aus"-erzwungenen) Modus
+  # zu verharren. Danach kann jederzeit manuell in einen anderen Modus
+  # gewechselt werden - das hier ist nur der Default beim Einstecken.
+  - alias: "Wallbox - Auto eingesteckt: Modus auf PV-Ueberschuss setzen"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.wallbox_auto_angeschlossen
+        to: "on"
+    action:
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.wallbox_lademodus
+        data:
+          option: "PV-Ueberschuss"

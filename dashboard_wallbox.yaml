@@ -1,0 +1,222 @@
+# ==============================================================================
+# DASHBOARD: Wallbox PV-Ladesteuerung
+# ==============================================================================
+#
+# Passendes Lovelace-Dashboard zu wallbox_ladesteuerung.yaml. Nutzt
+# ausschliesslich Entities, die das Package selbst anlegt - funktioniert also
+# direkt nach der Installation, ohne YAML-Anpassung.
+#
+# Die eigentlichen Wallbox-/Speicher-Rohwerte (Ladeleistung, Connector-Status,
+# Lade-aktiv-Status, Ladestrom-Vorgabe) liegen bei dir unter individuellen
+# Entity-IDs, die erst ueber die "Wallbox Konfig: ..."-Helfer (Abschnitt 0 im
+# Package) eingetragen werden. Diese Werte werden hier deshalb ueber
+# eingebaute "Template"-Karten angezeigt, die den Helfer zur Laufzeit
+# aufloesen (states(states('input_text.wallbox_cfg_...'))) - kein
+# HACS/Custom-Card noetig, das kann Home Assistant von Haus aus.
+#
+# INSTALLATION
+# ------------
+# 1. Einstellungen -> Dashboards -> Dashboard hinzufuegen -> "Neues Dashboard
+#    von Grund auf erstellen" (oder ein bestehendes Dashboard waehlen).
+# 2. Oben rechts (drei Punkte) -> "Im YAML-Modus bearbeiten" (falls noch nicht
+#    aktiv) -> gesamten Inhalt dieser Datei einfuegen -> Speichern.
+# 3. Falls die Helfer aus ABSCHNITT 0 noch nicht ausgefuellt sind, zeigt die
+#    erste Sektion das (siehe binary_sensor.wallbox_konfiguration_unvollstaendig)
+#    und du kannst sie direkt unten in der Sektion "Konfiguration" eintragen,
+#    ganz ohne Settings->Helfer aufzurufen.
+#
+# ==============================================================================
+title: Wallbox
+views:
+  - title: Ladesteuerung
+    path: ladesteuerung
+    icon: mdi:ev-station
+    type: sections
+    max_columns: 4
+    sections:
+      - type: grid
+        cards:
+          - type: heading
+            heading: "🎛️ Ladesteuerung"
+            heading_style: title
+          - type: tile
+            entity: input_select.wallbox_lademodus
+            name: Lademodus
+            icon: mdi:ev-station
+            grid_options:
+              columns: full
+            features:
+              - type: select-options
+          - type: tile
+            entity: binary_sensor.wallbox_auto_angeschlossen
+            name: Auto angeschlossen
+            icon: mdi:car-electric
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.wallbox_konfiguration_unvollstaendig
+                state: "on"
+            card:
+              type: tile
+              entity: binary_sensor.wallbox_konfiguration_unvollstaendig
+              name: "Konfiguration unvollständig – siehe unten"
+              icon: mdi:alert
+              color: red
+              grid_options:
+                columns: full
+      - type: grid
+        cards:
+          - type: heading
+            heading: "🚘 Wallbox – Live-Werte"
+            heading_style: title
+          - type: template
+            name: Ladeleistung
+            icon: mdi:flash
+            content: >
+              {{ states(states('input_text.wallbox_cfg_charger_power')) }} W
+          - type: template
+            name: Connector-Status
+            icon: mdi:information-outline
+            content: >
+              {{ states(states('input_text.wallbox_cfg_connector_status')) }}
+          - type: template
+            name: Lädt gerade
+            icon: mdi:play-circle
+            content: >
+              {{ 'Ja' if is_state(states('input_text.wallbox_cfg_charge_control'), 'on') else 'Nein' }}
+          - type: template
+            name: "Max. Ladestrom (Soll)"
+            icon: mdi:current-ac
+            content: >
+              {{ states(states('input_text.wallbox_cfg_maximum_current')) }} A
+      - type: grid
+        cards:
+          - type: heading
+            heading: "🔧 Konfiguration (einmalig)"
+            heading_style: title
+          - type: entities
+            title: "Wallbox Konfig: deine Entity-IDs"
+            entities:
+              - input_text.wallbox_cfg_charge_control
+              - input_text.wallbox_cfg_maximum_current
+              - input_text.wallbox_cfg_grid_power
+              - input_text.wallbox_cfg_battery_power
+              - input_text.wallbox_cfg_home_power
+              - input_text.wallbox_cfg_pv_power
+              - input_text.wallbox_cfg_charger_power
+              - input_text.wallbox_cfg_connector_status
+              - input_text.wallbox_cfg_solcast_remaining
+
+  - title: Erweitert
+    path: erweitert
+    icon: mdi:magnify-scan
+    type: sections
+    max_columns: 4
+    sections:
+      - type: grid
+        cards:
+          - type: heading
+            heading: "🧮 Regelsensoren (berechnet)"
+            heading_style: title
+          - type: tile
+            entity: sensor.wallbox_verfuegbarer_ladestrom
+            name: "Verfügbarer Ladestrom (akku-blind)"
+            icon: mdi:solar-power
+          - type: tile
+            entity: sensor.wallbox_verfuegbarer_ladestrom_ueberschussmodus
+            name: "Verfügbarer Ladestrom (PV-Überschuss-Modus)"
+            icon: mdi:solar-power
+          - type: tile
+            entity: sensor.wallbox_sollstrom_minpv
+            name: "Sollstrom (Min+PV)"
+            icon: mdi:current-ac
+          - type: tile
+            entity: sensor.wallbox_batterie_vorrang_schwelle_dynamisch
+            name: "Batterie-Vorrang Schwelle (aktuell wirksam)"
+            icon: mdi:battery-charging-70
+          - type: tile
+            entity: sensor.wallbox_mindeststrom_dynamisch
+            name: "Mindeststrom (aktuell wirksam)"
+            icon: mdi:lightning-bolt-outline
+          - type: tile
+            entity: sensor.wallbox_konfiguration_fehlende_helfer
+            name: "Fehlende Konfig-Helfer"
+            icon: mdi:alert-circle-outline
+      - type: grid
+        cards:
+          - type: heading
+            heading: "⏱️ Zähler / Start-Hysterese (Debug)"
+            heading_style: title
+          - type: tile
+            entity: input_number.wallbox_unterversorgung_counter
+            name: "Unterversorgung-Zähler"
+            icon: mdi:counter
+          - type: tile
+            entity: input_number.wallbox_ausreichend_pv_counter
+            name: "Ausreichend-PV-Zähler (Enable-Delay)"
+            icon: mdi:counter
+      - type: grid
+        cards:
+          - type: heading
+            heading: "⚙️ Einstellwerte je Modus"
+            heading_style: title
+          - type: tile
+            entity: input_number.wallbox_batterie_schwelle
+            name: "Batterie-Vorrang Schwelle Maximum (bei wenig PV-Prognose)"
+            icon: mdi:battery-charging-70
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: input_number.wallbox_batterie_schwelle_min
+            name: "Batterie-Vorrang Schwelle Minimum (bei viel PV-Prognose)"
+            icon: mdi:battery-charging-100
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: input_number.wallbox_pv_prognose_referenz
+            name: "PV-Prognose Referenzertrag (volle Absenkung ab hier)"
+            icon: mdi:weather-sunny
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: input_number.wallbox_ueberschuss_mindeststrom
+            name: "Mindeststrom Minimum (bei wenig PV-Prognose)"
+            icon: mdi:lightning-bolt-outline
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: input_number.wallbox_ueberschuss_mindeststrom_max
+            name: "Mindeststrom Maximum (bei viel PV-Prognose)"
+            icon: mdi:lightning-bolt
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: input_number.wallbox_sicherheitsabstand
+            name: "Sicherheitsabstand (Ziel-Netzbezug statt 0)"
+            icon: mdi:shield-outline
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: input_number.wallbox_min_ladestrom
+            name: "Mindeststrom (Min+PV)"
+            icon: mdi:lightning-bolt-outline
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: input_number.wallbox_boost_ladestrom
+            name: "Ladestrom (Sofortladen)"
+            icon: mdi:lightning-bolt
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: input_number.wallbox_akku_boost_ladestrom
+            name: "Ladestrom (Akku-Boost)"
+            icon: mdi:lightning-bolt
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: input_number.wallbox_akku_boost_schwelle
+            name: "Akku-Untergrenze (Akku-Boost)"
+            icon: mdi:battery-charging-30
+            features:
+              - type: numeric-input
