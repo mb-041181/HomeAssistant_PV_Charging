@@ -16,6 +16,8 @@ zusätzliche Software.
   (getestet mit [Solcast](https://www.home-assistant.io/integrations/solcast_solar/))
 - Start-Hysterese gegen Kurzschluss-Ein/Aus bei schwankendem PV-Ertrag
   (evcc-Vorbild: "Enable-Delay")
+- Getrennte Start-/Stopp-Schwelle plus sanfte Rampe des Mindeststroms
+  verhindern ein Pendeln um die Akku-Vorrang-Schwelle
 - Automatischer Moduswechsel beim Ein-/Ausstecken des Fahrzeugs
 
 ## Voraussetzungen
@@ -112,6 +114,8 @@ automation without any additional software.
   [Solcast](https://www.home-assistant.io/integrations/solcast_solar/))
 - Start hysteresis against rapid on/off cycling on fluctuating PV output
   (evcc-inspired: "Enable Delay")
+- Separate start/stop thresholds plus a gentle ramp of the minimum current
+  prevent oscillation around the battery-priority threshold
 - Automatic mode switch when the vehicle is plugged in/unplugged
 
 ## Requirements

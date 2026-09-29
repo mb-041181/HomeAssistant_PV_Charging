@@ -248,6 +248,25 @@ template:
             {{ (maximum - (maximum - minimum) * anteil) | round(0) }}
           {% endif %}
 
+      # Tatsaechliche Stopp-Schwelle: liegt bewusst UNTERHALB der Vorrang-
+      # Schwelle oben (Abstand ueber input_number.wallbox_batterie_stopp_puffer,
+      # siehe Abschnitt 3). Die Vorrang-Schwelle bleibt ausschliesslich der
+      # Wert, ab dem ein Ladevorgang wieder neu STARTEN darf (Automation
+      # "PV-Ueberschuss: laden"); tatsaechlich GESTOPPT (Automation
+      # "PV-Ueberschuss: pausieren (Batterie-Vorrang)") und die Rampenzone des
+      # Mindeststroms (siehe naechsten Sensor unten) verankern sich an dieser
+      # niedrigeren Stopp-Schwelle. Ohne diesen Abstand zwischen Start- und
+      # Stopp-Wert kann sich eine Regelschwingung aufschaukeln, sobald der
+      # Ladevorgang selbst den SOC minimal unter/ueber eine einzige
+      # gemeinsame Schwelle drueckt.
+      - name: "Wallbox Batterie-Vorrang Stopp-Schwelle"
+        unique_id: wallbox_batterie_stopp_schwelle
+        unit_of_measurement: "%"
+        state: >
+          {% set schwelle = states('sensor.wallbox_batterie_vorrang_schwelle_dynamisch') | float(90) %}
+          {% set puffer = states('input_number.wallbox_batterie_stopp_puffer') | float(15) %}
+          {{ [schwelle - puffer, 0] | max | round(0) }}
+
       # Dynamischer Mindeststrom (optionale Solcast-Integration, analog zur
       # Akku-Vorrang-Schwelle oben, aber mit UMGEKEHRTER Interpolationsrichtung:
       # bei viel PV-Prognose fuer den Rest des Tages darf der Mindeststrom
@@ -308,16 +327,30 @@ template:
       # wird unten in mehreren Automations-TRIGGERN gebraucht, wo Home
       # Assistant keine Helfer-Aufloesung erlaubt. Ein Mix aus Helfer hier
       # und Anker dort haette zwei Quellen fuer denselben Wert bedeutet.
+      #
+      # Der Mindeststrom faehrt oberhalb der Stopp-Schwelle (siehe Sensor
+      # "Wallbox Batterie-Vorrang Stopp-Schwelle" oben) nicht schlagartig auf
+      # den vollen Wert, sondern ueber input_number.wallbox_batterie_
+      # rampenbreite (Default 5%) linear hoch - direkt an der Stopp-Schwelle
+      # (Rampenfortschritt 0) zaehlt also weiterhin nur der echte
+      # PV-Ueberschuss. Die Rampe verankert sich bewusst an der (niedrigeren)
+      # Stopp-Schwelle statt der Vorrang-Schwelle: sonst wuerde jeder
+      # Wiederanlauf mitten in der Rampenzone starten, wo der Floor noch live
+      # vom SOC abhaengt - das beguenstigt seinerseits wieder eine
+      # Regelschwingung. Reduziert zusaetzlich den initialen Akku-Verbrauch
+      # nach einem Wiederanlauf.
       - name: "Wallbox Verfuegbarer Ladestrom Ueberschussmodus"
         unique_id: wallbox_verfuegbarer_ladestrom_ueberschussmodus
         unit_of_measurement: "A"
         state: >
           {% set verfuegbar = states('sensor.wallbox_verfuegbarer_ladestrom') | float(0) %}
           {% set soc = states('sensor.YOUR_BATTERY_SOC') | float(0) %}
-          {% set schwelle = states('sensor.wallbox_batterie_vorrang_schwelle_dynamisch') | float(90) %}
+          {% set schwelle = states('sensor.wallbox_batterie_stopp_schwelle') | float(90) %}
           {% if soc > schwelle %}
-            {% set mindest = states('sensor.wallbox_mindeststrom_dynamisch') | float(8) %}
-            {{ [ [verfuegbar, mindest] | max, 16] | min }}
+            {% set mindest_ziel = states('sensor.wallbox_mindeststrom_dynamisch') | float(8) %}
+            {% set rampenbreite = states('input_number.wallbox_batterie_rampenbreite') | float(5) %}
+            {% set fortschritt = 1 if rampenbreite <= 0 else ([ (soc - schwelle) / rampenbreite, 1] | min) %}
+            {{ [ [verfuegbar, mindest_ziel * fortschritt] | max, 16] | min }}
           {% else %}
             {{ verfuegbar }}
           {% endif %}
@@ -436,6 +469,35 @@ input_number:
     max: 100
     step: 1
     initial: 60
+    unit_of_measurement: "%"
+
+  # Puffer UNTERHALB der Vorrang-Schwelle (siehe sensor.wallbox_batterie_
+  # stopp_schwelle). Die Vorrang-Schwelle bleibt der Wert, ab dem ein
+  # Ladevorgang wieder neu starten darf; tatsaechlich GESTOPPT wird erst an
+  # dieser niedrigeren Stopp-Schwelle. Verhindert eine Regelschwingung, bei
+  # der der Ladevorgang selbst den SOC minimal unter/ueber eine einzige
+  # gemeinsame Schwelle drueckt und dadurch staendig neu startet/stoppt.
+  wallbox_batterie_stopp_puffer:
+    name: "Wallbox Akku-Vorrang Stopp-Puffer (unterhalb der Vorrang-Schwelle)"
+    icon: mdi:battery-arrow-down-outline
+    min: 0
+    max: 50
+    step: 1
+    initial: 15
+    unit_of_measurement: "%"
+
+  # Der Mindeststrom im Ueberschussmodus faehrt oberhalb der Stopp-Schwelle
+  # nicht schlagartig auf den vollen Wert, sondern linear ueber diese
+  # Bandbreite hoch (siehe sensor.wallbox_verfuegbarer_ladestrom_
+  # ueberschussmodus) - reduziert den initialen Akku-Verbrauch nach einem
+  # Wiederanlauf und damit zusaetzlich die Neigung zur Regelschwingung.
+  wallbox_batterie_rampenbreite:
+    name: "Wallbox Akku-Vorrang Rampenbreite"
+    icon: mdi:chart-line-variant
+    min: 0
+    max: 20
+    step: 1
+    initial: 5
     unit_of_measurement: "%"
 
   # Ab diesem prognostizierten Rest-Tagesertrag wird die Akku-Vorrang-Schwelle
@@ -673,11 +735,18 @@ automation:
   # die Wallbox wuerde trotz niedrigem SOC munter weiterladen. Deshalb
   # zusaetzlich ein time_pattern-Trigger mit explizitem "below"-Condition,
   # analog zum periodischen Nachfuehren in "PV-Ueberschuss: laden".
+  #
+  # Vergleicht gegen die (niedrigere) Stopp-Schwelle (sensor.wallbox_
+  # batterie_stopp_schwelle), NICHT gegen die Vorrang-Schwelle - siehe
+  # Kommentar bei input_number.wallbox_batterie_stopp_puffer. Die
+  # Vorrang-Schwelle bleibt der Wert, ab dem "PV-Ueberschuss: laden" einen
+  # Ladevorgang neu starten darf; tatsaechlich gestoppt wird erst hier, an
+  # der niedrigeren Stopp-Schwelle.
   - alias: "Wallbox - PV-Ueberschuss: pausieren (Batterie-Vorrang)"
     trigger:
       - platform: numeric_state
         entity_id: *battery_soc
-        below: sensor.wallbox_batterie_vorrang_schwelle_dynamisch
+        below: sensor.wallbox_batterie_stopp_schwelle
       - platform: time_pattern
         seconds: "/30"
     condition:
@@ -689,7 +758,7 @@ automation:
         state: "PV-Ueberschuss"
       - condition: numeric_state
         entity_id: *battery_soc
-        below: sensor.wallbox_batterie_vorrang_schwelle_dynamisch
+        below: sensor.wallbox_batterie_stopp_schwelle
     action:
       # charge_control AUS = nicht laden (siehe Polaritaets-Hinweis oben).
       # Guard wie bei 4.3 (siehe dortiger Kommentar) - vermeidet
@@ -715,6 +784,16 @@ automation:
   # geladen wird (charge_control "on"), greift die Zaehler-Bedingung NICHT -
   # das laufende Nachfuehren des Ladestroms bleibt so reaktionsschnell wie
   # bisher, nur der Erststart hat eine Verzoegerung.
+  #
+  # Die Haupt-Bedingung unten vergleicht gegen die (niedrigere) Stopp-
+  # Schwelle, damit das Nachfuehren des Ladestroms weiterlaeuft, solange der
+  # SOC ueber der Stopp-Schwelle liegt - nicht erst oberhalb der (hoeheren)
+  # Vorrang-Schwelle. Der eigentliche WIEDERANLAUF aus "aus" verlangt
+  # zusaetzlich, dass der SOC die hoehere Vorrang-Schwelle erreicht hat
+  # (siehe "and"-Bedingung weiter unten) - das ist die Sicherheitsmarge
+  # gegen ein sofortiges Wiederanspringen direkt nach dem Stopp. Siehe
+  # Kommentar bei input_number.wallbox_batterie_stopp_puffer fuer die volle
+  # Begruendung.
   - alias: "Wallbox - PV-Ueberschuss: laden"
     trigger:
       - platform: time_pattern
@@ -734,7 +813,7 @@ automation:
         state: "PV-Ueberschuss"
       - condition: numeric_state
         entity_id: *battery_soc
-        above: sensor.wallbox_batterie_vorrang_schwelle_dynamisch
+        above: sensor.wallbox_batterie_stopp_schwelle
       # "above: 5" statt 6, damit der feste Mindeststrom aus
       # wallbox_ueberschuss_mindeststrom (Default 8A) diese Bedingung
       # bei exakt 6A auch erfuellt (above:6 waere bei genau 6 = false).
@@ -745,9 +824,17 @@ automation:
         conditions:
           - condition: template
             value_template: "{{ is_state(states('input_text.wallbox_cfg_charge_control'), 'on') }}"
-          - condition: numeric_state
-            entity_id: input_number.wallbox_ausreichend_pv_counter
-            above: 1
+          # Wiederanlauf aus "aus": SOC muss die (hoehere) Vorrang-Schwelle
+          # erreicht haben, nicht nur die (niedrigere) Stopp-Schwelle oben -
+          # das ist die eigentliche Wiederanlauf-Sicherheitsmarge.
+          - condition: and
+            conditions:
+              - condition: numeric_state
+                entity_id: input_number.wallbox_ausreichend_pv_counter
+                above: 1
+              - condition: numeric_state
+                entity_id: *battery_soc
+                above: sensor.wallbox_batterie_vorrang_schwelle_dynamisch
     action:
       # charge_control AN = laden (siehe Polaritaets-Hinweis oben).
       # Nur aufrufen, wenn tatsaechlich noch "aus" - sonst schickt die OCPP-

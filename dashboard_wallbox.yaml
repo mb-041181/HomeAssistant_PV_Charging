@@ -39,14 +39,41 @@ views:
           - type: heading
             heading: "🎛️ Ladesteuerung"
             heading_style: title
-          - type: tile
-            entity: input_select.wallbox_lademodus
-            name: Lademodus
-            icon: mdi:ev-station
-            grid_options:
-              columns: full
-            features:
-              - type: select-options
+          # Lademodus-Kachel gesperrt/durchgestrichen, solange kein Auto
+          # angeschlossen ist (siehe binary_sensor.wallbox_auto_angeschlossen
+          # und Automation "Kein Auto: Modus auf Aus erzwingen" im Package) -
+          # der Modus laesst sich technisch trotzdem zurueckstellen, springt
+          # aber sofort wieder auf "Aus" zurueck.
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.wallbox_auto_angeschlossen
+                state: "on"
+            card:
+              type: tile
+              entity: input_select.wallbox_lademodus
+              name: Lademodus
+              icon: mdi:ev-station
+              grid_options:
+                columns: full
+              features:
+                - type: select-options
+          - type: conditional
+            conditions:
+              - condition: state
+                entity: binary_sensor.wallbox_auto_angeschlossen
+                state: "off"
+            card:
+              type: tile
+              entity: input_select.wallbox_lademodus
+              name: Lademodus
+              icon: mdi:lock
+              color: disabled
+              grid_options:
+                columns: full
+              tap_action:
+                action: none
+              state_content: state
           - type: tile
             entity: binary_sensor.wallbox_auto_angeschlossen
             name: Auto angeschlossen
@@ -132,8 +159,12 @@ views:
             icon: mdi:current-ac
           - type: tile
             entity: sensor.wallbox_batterie_vorrang_schwelle_dynamisch
-            name: "Batterie-Vorrang Schwelle (aktuell wirksam)"
+            name: "Batterie-Vorrang Schwelle – Start (aktuell wirksam)"
             icon: mdi:battery-charging-70
+          - type: tile
+            entity: sensor.wallbox_batterie_stopp_schwelle
+            name: "Batterie-Vorrang Schwelle – Stopp (aktuell wirksam)"
+            icon: mdi:battery-charging-30
           - type: tile
             entity: sensor.wallbox_mindeststrom_dynamisch
             name: "Mindeststrom (aktuell wirksam)"
@@ -170,6 +201,18 @@ views:
             entity: input_number.wallbox_batterie_schwelle_min
             name: "Batterie-Vorrang Schwelle Minimum (bei viel PV-Prognose)"
             icon: mdi:battery-charging-100
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: input_number.wallbox_batterie_stopp_puffer
+            name: "Akku-Vorrang Stopp-Puffer (unterhalb der Vorrang-Schwelle)"
+            icon: mdi:battery-arrow-down-outline
+            features:
+              - type: numeric-input
+          - type: tile
+            entity: input_number.wallbox_batterie_rampenbreite
+            name: "Akku-Vorrang Rampenbreite"
+            icon: mdi:chart-line-variant
             features:
               - type: numeric-input
           - type: tile
